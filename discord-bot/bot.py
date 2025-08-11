@@ -75,6 +75,15 @@ class BuffEntry:
 # Utilities
 # --------------------------------------------------------------------------------------
 
+# In-memory cache mapping Discord message ID -> list of published BuffEntry
+MESSAGE_ID_TO_BUFFS: Dict[int, List[BuffEntry]] = {}
+
+# Keywords that indicate a cancellation/removal in a reply
+CANCEL_KEYWORDS = {
+    "cancel", "canceled", "cancelled", "delete", "remove", "revoke", "scratch", "no go", "nogo", "abort",
+}
+
+
 def clean_json_from_text(text: str) -> str:
     """Extract a JSON array from a text that may contain markdown fences or prose.
     Returns the raw JSON string representing an array.
@@ -117,14 +126,17 @@ def detect_faction_from_message(message_content: str, channel_type: Optional[str
 # OpenAI parsing (blocking + async wrapper)
 # --------------------------------------------------------------------------------------
 
-def parse_buff_with_ai_blocking(message_content: str) -> List[Dict[str, Any]]:
+def parse_buff_with_ai_blocking(message_content: str, anchor_date: Optional[str] = None) -> List[Dict[str, Any]]:
     """Blocking call to OpenAI API to parse a buff message into structured data.
     Wrapped by an async adapter to avoid blocking the event loop.
+
+    anchor_date: if provided (YYYY-MM-DD), use this as "today" for prompts where date is missing
+    to ensure edits/deletes use the original message's date context.
     """
     if client is None:
         raise RuntimeError("OpenAI client is not configured")
 
-    today = datetime.now().strftime("%Y-%m-%d")
+    today = anchor_date or datetime.now().strftime("%Y-%m-%d")
 
     prompt = f"""You are an expert data extraction assistant tasked with parsing Discord messages about World of Warcraft buffs. Your goal is to extract structured information while being flexible enough to handle various human-written formats.
 
@@ -222,9 +234,9 @@ Key rules:
     raise RuntimeError(f"Failed to parse message with AI after retries: {last_err}")
 
 
-async def parse_buff_with_ai(message_content: str) -> Optional[List[Dict[str, Any]]]:
+async def parse_buff_with_ai(message_content: str, *, anchor_date: Optional[str] = None) -> Optional[List[Dict[str, Any]]]:
     try:
-        return await asyncio.to_thread(parse_buff_with_ai_blocking, message_content)
+        return await asyncio.to_thread(parse_buff_with_ai_blocking, message_content, anchor_date)
     except Exception as exc:  # noqa: BLE001
         logger.error("Error parsing with AI: %s", exc)
         return None
@@ -233,7 +245,38 @@ async def parse_buff_with_ai(message_content: str) -> Optional[List[Dict[str, An
 # GitHub publishing (blocking + async wrapper)
 # --------------------------------------------------------------------------------------
 
-def publish_buff_to_github_blocking(buff_data: Dict[str, Any], *, is_edit: bool = False, original_message: Optional[str] = None) -> bool:
+def _github_fetch_current(session: requests.Session, url: str) -> Optional[Dict[str, Any]]:
+    resp = session.get(url, timeout=20)
+    if not resp.ok:
+        logger.error("Failed to fetch file: %s", resp.text)
+        return None
+    return resp.json()
+
+
+def _github_put_with_retry(session: requests.Session, url: str, content_list: List[Dict[str, Any]], sha: str, commit_message: str) -> bool:
+    body = {
+        "message": commit_message,
+        "content": base64.b64encode(json.dumps(content_list, indent=4).encode("utf-8")).decode("utf-8"),
+        "sha": sha,
+    }
+    # Retry a few times on 409 conflicts
+    for attempt in range(3):
+        put_resp = session.put(url, json=body, timeout=20)
+        if put_resp.ok:
+            return True
+        if put_resp.status_code == 409:
+            # Refetch latest sha and retry once
+            latest = _github_fetch_current(session, url)
+            if not latest:
+                return False
+            body["sha"] = latest.get("sha", sha)
+            continue
+        logger.error("Failed to update file: %s", put_resp.text)
+        return False
+    return False
+
+
+def publish_buff_to_github_blocking(buff_data: Dict[str, Any], *, is_edit: bool = False, original_message: Optional[str] = None, old_entries_to_remove: Optional[List[BuffEntry]] = None, anchor_date_for_original: Optional[str] = None) -> bool:
     if not GITHUB_TOKEN:
         logger.error("GitHub token not configured")
         return False
@@ -249,19 +292,40 @@ def publish_buff_to_github_blocking(buff_data: Dict[str, Any], *, is_edit: bool 
         "Accept": "application/vnd.github.v3+json",
     }
 
-    # Use a short-lived Session per call to benefit from connection pooling
     with requests.Session() as session:
         session.headers.update(headers)
-
-        # Fetch current file
         url = f"https://api.github.com/repos/cougtrades/wowbuffs/contents/{path}"
-        file_response = session.get(url, timeout=20)
-        if not file_response.ok:
-            logger.error("Failed to fetch file %s: %s", path, file_response.text)
+
+        file_data = _github_fetch_current(session, url)
+        if not file_data:
             return False
 
-        file_data = file_response.json()
         current_content: List[Dict[str, Any]] = json.loads(base64.b64decode(file_data["content"]).decode("utf-8"))
+
+        # Remove old entries if provided (for edit or replacements)
+        if old_entries_to_remove:
+            remove_keys = {(e.datetime, e.guild.lower(), e.buff) for e in old_entries_to_remove}
+            current_content = [
+                b for b in current_content
+                if (b.get("datetime"), str(b.get("guild", "")).lower(), b.get("buff")) not in remove_keys
+            ]
+
+        # Fallback: if is_edit and no explicit entries, try parse original_message anchored to its date
+        elif is_edit and original_message:
+            try:
+                original_list = parse_buff_with_ai_blocking(original_message, anchor_date=anchor_date_for_original)
+                if original_list:
+                    original_buff = BuffEntry.from_dict(original_list[0])
+                    current_content = [
+                        b for b in current_content
+                        if not (
+                            b.get("datetime") == original_buff.datetime
+                            and str(b.get("guild", "")).lower() == original_buff.guild.lower()
+                            and b.get("buff") == original_buff.buff
+                        )
+                    ]
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Failed to parse original message during edit cleanup: %s", exc)
 
         new_buff = BuffEntry.from_dict(
             {
@@ -283,57 +347,91 @@ def publish_buff_to_github_blocking(buff_data: Dict[str, Any], *, is_edit: bool 
             )
             return True
 
-        # If this is an edit, parse the original message and remove the old entry
-        if is_edit and original_message:
-            try:
-                original_list = parse_buff_with_ai_blocking(original_message)
-                if original_list:
-                    original_buff = BuffEntry.from_dict(original_list[0])
-                    current_content = [
-                        b
-                        for b in current_content
-                        if not (
-                            b.get("datetime") == original_buff.datetime
-                            and str(b.get("guild", "")).lower() == original_buff.guild.lower()
-                            and b.get("buff") == original_buff.buff
-                        )
-                    ]
-            except Exception as exc:  # noqa: BLE001
-                logger.warning("Failed to parse original message during edit cleanup: %s", exc)
-
         # Add new buff and sort
         current_content.append(new_buff.__dict__)
         current_content.sort(key=lambda x: x["datetime"])  # ISO datetime sorts lexicographically
 
-        # Update file on GitHub
-        update_response = session.put(
+        ok = _github_put_with_retry(
+            session,
             url,
-            json={
-                "message": f'Update {path} with new buff from Discord: {new_buff.guild} {new_buff.buff}',
-                "content": base64.b64encode(json.dumps(current_content, indent=4).encode("utf-8")).decode("utf-8"),
-                "sha": file_data["sha"],
-            },
-            timeout=20,
+            current_content,
+            file_data.get("sha", ""),
+            f'Update {path} with new buff from Discord: {new_buff.guild} {new_buff.buff}',
         )
-
-        if not update_response.ok:
-            logger.error("Failed to update file %s: %s", path, update_response.text)
+        if not ok:
             return False
 
         logger.info("Published buff: %s %s", new_buff.guild, new_buff.buff)
         return True
 
 
-async def publish_buff_to_github(buff_data: Dict[str, Any], *, is_edit: bool = False, original_message: Optional[str] = None) -> bool:
+async def publish_buff_to_github(buff_data: Dict[str, Any], *, is_edit: bool = False, original_message: Optional[str] = None, old_entries_to_remove: Optional[List[BuffEntry]] = None, anchor_date_for_original: Optional[str] = None) -> bool:
     try:
         return await asyncio.to_thread(
             publish_buff_to_github_blocking,
             buff_data,
             is_edit=is_edit,
             original_message=original_message,
+            old_entries_to_remove=old_entries_to_remove,
+            anchor_date_for_original=anchor_date_for_original,
         )
     except Exception as exc:  # noqa: BLE001
         logger.error("Error publishing to GitHub: %s", exc)
+        return False
+
+
+def remove_buffs_from_github_blocking(faction: str, entries_to_remove: List[BuffEntry]) -> bool:
+    if not GITHUB_TOKEN:
+        logger.error("GitHub token not configured")
+        return False
+    if faction not in {"horde", "alliance"}:
+        logger.error("Invalid faction: %s", faction)
+        return False
+
+    path = f"{faction}_buffs.json"
+    headers = {
+        "Authorization": f"token {GITHUB_TOKEN}",
+        "Accept": "application/vnd.github.v3+json",
+    }
+
+    with requests.Session() as session:
+        session.headers.update(headers)
+        url = f"https://api.github.com/repos/cougtrades/wowbuffs/contents/{path}"
+
+        file_data = _github_fetch_current(session, url)
+        if not file_data:
+            return False
+
+        current_content: List[Dict[str, Any]] = json.loads(base64.b64decode(file_data["content"]).decode("utf-8"))
+        remove_keys = {(e.datetime, e.guild.lower(), e.buff) for e in entries_to_remove}
+        new_content = [
+            b for b in current_content
+            if (b.get("datetime"), str(b.get("guild", "")).lower(), b.get("buff")) not in remove_keys
+        ]
+
+        if new_content == current_content:
+            logger.info("No matching entries to remove for %s", path)
+            return True
+
+        ok = _github_put_with_retry(
+            session,
+            url,
+            new_content,
+            file_data.get("sha", ""),
+            f"Remove {len(entries_to_remove)} buff(s) via Discord reply/delete",
+        )
+        if not ok:
+            return False
+
+        logger.info("Removed %d buff(s) from %s", len(entries_to_remove), path)
+        return True
+
+
+async def remove_buffs_from_github(faction: str, entries_to_remove: List[BuffEntry]) -> bool:
+    try:
+        return await asyncio.to_thread(remove_buffs_from_github_blocking, faction, entries_to_remove)
+    except Exception as exc:  # noqa: BLE001
+        logger.error("Error removing buffs from GitHub: %s", exc)
         return False
 
 # --------------------------------------------------------------------------------------
@@ -347,6 +445,9 @@ async def process_and_publish(
     is_edit: bool = False,
     original_message: Optional[str] = None,
     author_for_logs: str = "",
+    message_id: Optional[int] = None,
+    anchor_date_str: Optional[str] = None,
+    old_entries_to_remove: Optional[List[BuffEntry]] = None,
 ) -> None:
     if not detected_faction:
         logger.info("Could not detect faction from message content")
@@ -355,12 +456,14 @@ async def process_and_publish(
     logger.info("Processing message from %s", author_for_logs or "unknown")
     logger.debug("Content: %s", message_content)
 
-    buff_data_list = await parse_buff_with_ai(message_content)
+    buff_data_list = await parse_buff_with_ai(message_content, anchor_date=anchor_date_str)
     if not buff_data_list:
         logger.info("No buffs found in the message or parsing failed")
         return
 
     logger.info("Found %d buff(s)", len(buff_data_list))
+
+    published_entries: List[BuffEntry] = []
     for buff_data in buff_data_list:
         # Validate and enrich
         try:
@@ -378,7 +481,19 @@ async def process_and_publish(
             "server": entry.server,
             "faction": detected_faction,
         }
-        await publish_buff_to_github(buff_payload, is_edit=is_edit, original_message=original_message)
+        ok = await publish_buff_to_github(
+            buff_payload,
+            is_edit=is_edit,
+            original_message=original_message,
+            old_entries_to_remove=old_entries_to_remove,
+            anchor_date_for_original=anchor_date_str,
+        )
+        if ok:
+            published_entries.append(entry)
+
+    # Update cache mapping for subsequent edits/deletes
+    if message_id and published_entries:
+        MESSAGE_ID_TO_BUFFS[message_id] = published_entries
 
 # --------------------------------------------------------------------------------------
 # Discord events and commands
@@ -402,10 +517,14 @@ async def on_ready() -> None:
                 if message.author == bot.user:
                     continue
                 detected_faction = detect_faction_from_message(message.content, channel_type)
+                # Anchor to the posted date so any implicit dates are stable
+                anchor_date_str = message.created_at.strftime("%Y-%m-%d") if message.created_at else None
                 await process_and_publish(
                     message.content,
                     detected_faction,
                     author_for_logs=getattr(message.author, "name", ""),
+                    message_id=message.id,
+                    anchor_date_str=anchor_date_str,
                 )
         except Exception as exc:  # noqa: BLE001
             logger.error("Failed to read history for channel %s: %s", channel_id, exc)
@@ -417,20 +536,78 @@ async def on_message(message: discord.Message) -> None:
         return
 
     # Check if message is from any of our buff channels
-    channel_faction: Optional[str] = None
-    for faction_key, (channel_id, channel_type) in BUFF_CHANNEL.items():
+    channel_type: Optional[str] = None
+    for _, (channel_id, ctype) in BUFF_CHANNEL.items():
         if message.channel.id == channel_id:
-            channel_faction = detect_faction_from_message(message.content, channel_type)
+            channel_type = ctype
             break
 
-    if not channel_faction:
+    if not channel_type:
         await bot.process_commands(message)
         return
 
+    # Handle replies for cancel or replacement
+    if message.reference and message.reference.message_id:
+        try:
+            referenced: Optional[discord.Message] = message.reference.resolved  # may be None
+            if referenced is None:
+                referenced = await message.channel.fetch_message(message.reference.message_id)
+        except Exception:  # noqa: BLE001
+            referenced = None
+
+        if referenced and referenced.author != bot.user:
+            detected_faction = detect_faction_from_message(message.content, channel_type)
+            # Cancellation command
+            if any(kw in message.content.lower() for kw in CANCEL_KEYWORDS):
+                entries = MESSAGE_ID_TO_BUFFS.get(referenced.id)
+                if not entries:
+                    # Fallback: parse referenced content anchored to its date
+                    anchor_date_str = referenced.created_at.strftime("%Y-%m-%d") if referenced.created_at else None
+                    parsed = await parse_buff_with_ai(referenced.content, anchor_date=anchor_date_str)
+                    if parsed:
+                        entries = [BuffEntry.from_dict(p) for p in parsed]
+                if entries:
+                    faction = detect_faction_from_message(referenced.content, channel_type) or detect_faction_from_message(message.content, channel_type)
+                    if faction:
+                        await remove_buffs_from_github(faction, entries)
+                        MESSAGE_ID_TO_BUFFS.pop(referenced.id, None)
+                # Do not proceed to normal processing
+                await bot.process_commands(message)
+                return
+
+            # Replacement: reply contains a new buff; remove old entries for referenced message id, then publish new
+            parsed_reply = await parse_buff_with_ai(message.content)
+            if parsed_reply:
+                old_entries = MESSAGE_ID_TO_BUFFS.get(referenced.id)
+                if not old_entries and referenced:
+                    anchor_date_str = referenced.created_at.strftime("%Y-%m-%d") if referenced.created_at else None
+                    parsed_old = await parse_buff_with_ai(referenced.content, anchor_date=anchor_date_str)
+                    if parsed_old:
+                        old_entries = [BuffEntry.from_dict(p) for p in parsed_old]
+                # Remove old entries first
+                faction = detect_faction_from_message(message.content, channel_type)
+                if faction and old_entries:
+                    await remove_buffs_from_github(faction, old_entries)
+                    MESSAGE_ID_TO_BUFFS.pop(referenced.id, None)
+                # Then publish new entries while associating them with the original message id
+                anchor_date_str_new = message.created_at.strftime("%Y-%m-%d") if message.created_at else None
+                await process_and_publish(
+                    message.content,
+                    detect_faction_from_message(message.content, channel_type),
+                    author_for_logs=getattr(message.author, "name", ""),
+                    message_id=referenced.id,  # map new entries to original message
+                    anchor_date_str=anchor_date_str_new,
+                )
+                await bot.process_commands(message)
+                return
+
+    # Normal non-reply message handling
     await process_and_publish(
         message.content,
-        channel_faction,
+        detect_faction_from_message(message.content, channel_type),
         author_for_logs=getattr(message.author, "name", ""),
+        message_id=message.id,
+        anchor_date_str=message.created_at.strftime("%Y-%m-%d") if message.created_at else None,
     )
 
     await bot.process_commands(message)
@@ -442,22 +619,51 @@ async def on_message_edit(before: discord.Message, after: discord.Message) -> No
         return
 
     # Check if message is from any of our buff channels
-    channel_faction: Optional[str] = None
-    for faction_key, (channel_id, channel_type) in BUFF_CHANNEL.items():
+    channel_type: Optional[str] = None
+    for _, (channel_id, ctype) in BUFF_CHANNEL.items():
         if after.channel.id == channel_id:
-            channel_faction = detect_faction_from_message(after.content, channel_type)
+            channel_type = ctype
             break
 
-    if not channel_faction:
+    if not channel_type:
         return
+
+    # For edits, try to remove previously published entries using cache; fallback to parsing anchored to original date
+    old_entries = MESSAGE_ID_TO_BUFFS.get(before.id)
+    anchor_date_str = before.created_at.strftime("%Y-%m-%d") if before.created_at else None
 
     await process_and_publish(
         after.content,
-        channel_faction,
+        detect_faction_from_message(after.content, channel_type),
         is_edit=True,
         original_message=before.content,
         author_for_logs=getattr(after.author, "name", ""),
+        message_id=after.id,
+        anchor_date_str=after.created_at.strftime("%Y-%m-%d") if after.created_at else None,
+        old_entries_to_remove=old_entries,
     )
+
+
+@bot.event
+async def on_message_delete(message: discord.Message) -> None:
+    # Remove associated buffs if a source message is deleted
+    if message.author == bot.user:
+        return
+    channel_type: Optional[str] = None
+    for _, (channel_id, ctype) in BUFF_CHANNEL.items():
+        if message.channel.id == channel_id:
+            channel_type = ctype
+            break
+    if not channel_type:
+        return
+
+    entries = MESSAGE_ID_TO_BUFFS.pop(message.id, None)
+    if not entries:
+        return
+
+    faction = detect_faction_from_message(message.content, channel_type)
+    if faction:
+        await remove_buffs_from_github(faction, entries)
 
 
 @bot.command(name="test_parse")
