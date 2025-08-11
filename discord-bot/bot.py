@@ -1,57 +1,132 @@
 import os
 import re
+import json
+import base64
+import logging
+import asyncio
+from dataclasses import dataclass
+from datetime import datetime
+from typing import Any, Dict, List, Optional
+
 import discord
 from discord.ext import commands
 from dotenv import load_dotenv
-from datetime import datetime, timedelta
-import logging
 from openai import OpenAI
-import json
-import time
-import random
-import sys
-import base64
 import requests
 
-# Set up logging
+# --------------------------------------------------------------------------------------
+# Logging setup
+# --------------------------------------------------------------------------------------
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Load environment variables from .env file
+# --------------------------------------------------------------------------------------
+# Environment and clients
+# --------------------------------------------------------------------------------------
 load_dotenv()
 
-# Set up OpenAI client
-client = OpenAI(api_key=os.getenv('OPENAIKEY'))
+OPENAI_API_KEY = os.getenv("OPENAIKEY")
+DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
+GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
 
-# Set up bot with necessary intents
+if not OPENAI_API_KEY:
+    logger.error("OPENAIKEY not found in environment")
+client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
+
+# Using a constant for model selection improves maintainability
+OPENAI_MODEL_NAME = "gpt-4.1"
+
+# --------------------------------------------------------------------------------------
+# Discord bot setup
+# --------------------------------------------------------------------------------------
 intents = discord.Intents.default()
 intents.message_content = True
-bot = commands.Bot(command_prefix='!', intents=intents)
+bot = commands.Bot(command_prefix="!", intents=intents)
 
 # Configuration for the buff channels
-BUFF_CHANNEL = {
-    'horde': (1306953557378859119, 'horde'),  # Horde channel
-    'alliance': (1336750424048271381, 'alliance'),  # Alliance channel
-    'both': (1366901374826315837, 'both')  # Zandalar channel
+BUFF_CHANNEL: Dict[str, tuple[int, str]] = {
+    "horde": (1306953557378859119, "horde"),
+    "alliance": (1336750424048271381, "alliance"),
+    "both": (1366901374826315837, "both"),
 }
 
-# Note: Currently all channels are using the same ID (1366901374826315837) which is the 🐲world-buffs-zandalar channel
-# This means the bot will only monitor one channel. To monitor separate channels, we need the correct channel IDs for:
-# - Horde channel
-# - Alliance channel
-# - Both channel
+# --------------------------------------------------------------------------------------
+# Data model
+# --------------------------------------------------------------------------------------
+@dataclass
+class BuffEntry:
+    datetime: str
+    guild: str
+    buff: str
+    notes: str
+    server: str
 
-def parse_buff_with_ai(message_content):
-    """Use OpenAI to parse buff messages and format them for the buff system"""
-    try:
-        print("\nParsing message with OpenAI...")
-       
-        # Get today's date for default date handling
-        today = datetime.now()
-        today_str = today.strftime("%Y-%m-%d")
-       
-        # Create a prompt that explains what we want
-        prompt = f"""You are an expert data extraction assistant tasked with parsing Discord messages about World of Warcraft buffs. Your goal is to extract structured information while being flexible enough to handle various human-written formats.
+    @staticmethod
+    def from_dict(data: Dict[str, Any]) -> "BuffEntry":
+        return BuffEntry(
+            datetime=str(data["datetime"]).strip(),
+            guild=str(data["guild"]).strip(),
+            buff=str(data["buff"]).strip(),
+            notes=str(data.get("notes", "")).strip(),
+            server=str(data.get("server", "Doomhowl")).strip() or "Doomhowl",
+        )
+
+# --------------------------------------------------------------------------------------
+# Utilities
+# --------------------------------------------------------------------------------------
+
+def clean_json_from_text(text: str) -> str:
+    """Extract a JSON array from a text that may contain markdown fences or prose.
+    Returns the raw JSON string representing an array.
+    """
+    cleaned = text.strip()
+    # Remove common markdown fences
+    cleaned = cleaned.replace("```json", "").replace("```", "").strip()
+    # Try to extract the outermost JSON array if extra text is present
+    start = cleaned.find("[")
+    end = cleaned.rfind("]")
+    if start != -1 and end != -1 and end > start:
+        return cleaned[start : end + 1]
+    return cleaned
+
+
+def is_duplicate_buff(new_buff: BuffEntry, existing: List[Dict[str, Any]]) -> bool:
+    for existing_buff in existing:
+        if (
+            existing_buff.get("datetime") == new_buff.datetime
+            and str(existing_buff.get("guild", "")).lower() == new_buff.guild.lower()
+            and existing_buff.get("buff") == new_buff.buff
+        ):
+            return True
+    return False
+
+
+def detect_faction_from_message(message_content: str, channel_type: Optional[str] = None) -> Optional[str]:
+    """Detect faction from message content based on channel type and emojis/keywords."""
+    if channel_type == "both":
+        lower = message_content.lower()
+        # Support both custom emoji names and plain words
+        if ":horde:" in lower or "horde" in lower:
+            return "horde"
+        if ":alliance:" in lower or "alliance" in lower:
+            return "alliance"
+        return None
+    return channel_type
+
+# --------------------------------------------------------------------------------------
+# OpenAI parsing (blocking + async wrapper)
+# --------------------------------------------------------------------------------------
+
+def parse_buff_with_ai_blocking(message_content: str) -> List[Dict[str, Any]]:
+    """Blocking call to OpenAI API to parse a buff message into structured data.
+    Wrapped by an async adapter to avoid blocking the event loop.
+    """
+    if client is None:
+        raise RuntimeError("OpenAI client is not configured")
+
+    today = datetime.now().strftime("%Y-%m-%d")
+
+    prompt = f"""You are an expert data extraction assistant tasked with parsing Discord messages about World of Warcraft buffs. Your goal is to extract structured information while being flexible enough to handle various human-written formats.
 
 Key Requirements:
 1. Extract these fields from the message:
@@ -66,7 +141,7 @@ Key Requirements:
    - Convert all times to UTC/Z format
    - For times 18:00-23:59 MT: Add 6 hours and use next day's date
    - For times 00:00-17:59 MT: Add 6 hours and use same day's date
-   - If no date is specified in the message, use today's date ({today_str})
+   - If no date is specified in the message, use today's date ({today})
    - Always use server name "Doomhowl"
    - Handle DST: After March 9, 2025, use 6-hour offset; before that, use 7-hour offset
    - IMPORTANT: Both Horde and Alliance use the same time conversion rules
@@ -84,16 +159,7 @@ Key Requirements:
    - Handle various AM/PM indicators or lack thereof
    - Handle various date formats
    - Handle various timezone indicators (ST, Server Time, etc.)
-   - When no date is specified, use today's date ({today_str})
-
-Example Conversions:
-- "1800 ST" → Use today's date + 6 hours
-- "8:15 ST" → Use today's date + 6 hours
-- "8:15 ST 6/10" → "2025-06-11T02:15:00Z" (8:15 PM MT + 6 hours = 02:15 next day UTC)
-- "7:45 ST 6/11" → "2025-06-12T01:45:00Z" (7:45 PM MT + 6 hours = 01:45 next day UTC)
-- "7:47 ST 6/11 (have nef backup)" → "2025-06-12T01:47:00Z" (7:47 PM MT + 6 hours = 01:47 next day UTC)
-- "6:55 PM ST" → Use today's date + 6 hours
-- "6:58 PM ST" → Use today's date + 6 hours
+   - When no date is specified, use today's date ({today})
 
 Process this message and return the extracted information in JSON format:
 {message_content}
@@ -109,286 +175,332 @@ Return the data in this exact format:
     }}
 ]"""
 
-        # Call OpenAI API
-        response = client.chat.completions.create(
-            model="gpt-4.1",
-            messages=[
-                {"role": "system", "content": f"""You are a WoW buff message parser that handles various human-written formats.
-                Your task is to extract buff information and convert times to UTC/Z format.
-                Key rules:
-                1. Server Time (ST) is Mountain Time
-                2. Convert all times to UTC/Z by adding 6 hours
-                3. Use next day's date for times 18:00-23:59 MT
-                4. Use same day's date for times 00:00-17:59 MT
-                5. If no date is specified, use today's date ({today_str})
-                6. Always use server name Doomhowl
-                7. Handle DST: After March 9, 2025, use 6-hour offset; before that, use 7-hour offset
-                8. Standardize buff names to: Zandalar, Nefarian, Rend, or Onyxia
-                9. Be flexible with time formats - handle both 12/24 hour, various separators, and AM/PM indicators
-                10. Both Horde and Alliance use the same time conversion rules
-                11. Example: 6:55 PM ST becomes 00:55 UTC next day (not 01:55)"""},
-                {"role": "user", "content": prompt}
-            ],
-            temperature=0.1  # Low temperature for more consistent results
-        )
+    system_prompt = f"""You are a WoW buff message parser that handles various human-written formats.
+Your task is to extract buff information and convert times to UTC/Z format.
+Key rules:
+1. Server Time (ST) is Mountain Time
+2. Convert all times to UTC/Z by adding 6 hours
+3. Use next day's date for times 18:00-23:59 MT
+4. Use same day's date for times 00:00-17:59 MT
+5. If no date is specified, use today's date ({today})
+6. Always use server name Doomhowl
+7. Handle DST: After March 9, 2025, use 6-hour offset; before that, use 7-hour offset
+8. Standardize buff names to: Zandalar, Nefarian, Rend, or Onyxia
+9. Be flexible with time formats - handle both 12/24 hour, various separators, and AM/PM indicators
+10. Both Horde and Alliance use the same time conversion rules
+11. Example: 6:55 PM ST becomes 00:55 UTC next day (not 01:55)"""
 
-        # Extract the JSON response and clean it
-        json_str = response.choices[0].message.content.strip()
-        print(f"AI Response: {json_str}")
-       
-        # Remove markdown code block markers if present
-        json_str = json_str.replace('```json', '').replace('```', '').strip()
-       
-        # Parse the JSON
-        buff_data_list = json.loads(json_str)
-       
-        return buff_data_list
+    # Simple retry with exponential backoff
+    last_err: Optional[Exception] = None
+    for attempt in range(3):
+        try:
+            response = client.chat.completions.create(
+                model=OPENAI_MODEL_NAME,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": prompt},
+                ],
+                temperature=0.1,
+            )
+            raw = response.choices[0].message.content or "[]"
+            cleaned = clean_json_from_text(raw)
+            data = json.loads(cleaned)
+            if not isinstance(data, list):
+                logger.warning("AI parse did not return a list; coercing to list if possible")
+                data = [data]
+            return data
+        except Exception as err:  # noqa: BLE001
+            last_err = err
+            sleep_seconds = 1.5 * (2 ** attempt)
+            logger.warning("AI parse attempt %s failed: %s. Retrying in %.1fs", attempt + 1, err, sleep_seconds)
+            time_to_sleep = min(sleep_seconds, 6)
+            # Sleep inside blocking function
+            import time as _time  # local import to avoid top-level shadowing
 
-    except Exception as e:
-        print(f"❌ Error parsing with AI: {str(e)}")
+            _time.sleep(time_to_sleep)
+    # If all retries failed, raise a consolidated error
+    raise RuntimeError(f"Failed to parse message with AI after retries: {last_err}")
+
+
+async def parse_buff_with_ai(message_content: str) -> Optional[List[Dict[str, Any]]]:
+    try:
+        return await asyncio.to_thread(parse_buff_with_ai_blocking, message_content)
+    except Exception as exc:  # noqa: BLE001
+        logger.error("Error parsing with AI: %s", exc)
         return None
 
-@bot.event
-async def on_ready():
-    print(f'Bot is ready! Logged in as {bot.user.name}')
-   
-    # Monitor both channels
-    for faction, (channel_id, faction_name) in BUFF_CHANNEL.items():
-        channel = bot.get_channel(channel_id)
-        if channel:
-            print(f'Monitoring {faction} channel: {channel.name}')
-           
-            async for message in channel.history(limit=1):
-                if message.author != bot.user:
-                    print(f'\nProcessing last message from {message.author.name}:')
-                    print(f'Content: {message.content}')
-                   
-                    # Detect faction based on channel type
-                    detected_faction = detect_faction_from_message(message.content, faction)
-                    if not detected_faction:
-                        print("Could not detect faction from message content")
-                        continue
-                   
-                    buff_data_list = parse_buff_with_ai(message.content)
-                   
-                    if buff_data_list:
-                        print(f'\nFound {len(buff_data_list)} buffs:')
-                        for buff_data in buff_data_list:
-                            print(f"- {buff_data['buff']} by {buff_data['guild']} at {buff_data['datetime']}")
-                            buff_data['faction'] = detected_faction
-                            await publish_buff_to_github(buff_data)
-        else:
-            print(f'❌ Channel not found (ID: {channel_id})')
+# --------------------------------------------------------------------------------------
+# GitHub publishing (blocking + async wrapper)
+# --------------------------------------------------------------------------------------
 
-@bot.event
-async def on_message(message):
-    if message.author == bot.user:
-        return
+def publish_buff_to_github_blocking(buff_data: Dict[str, Any], *, is_edit: bool = False, original_message: Optional[str] = None) -> bool:
+    if not GITHUB_TOKEN:
+        logger.error("GitHub token not configured")
+        return False
 
-    # Check if message is from any of our buff channels
-    channel_faction = None
-    for faction, (channel_id, faction_name) in BUFF_CHANNEL.items():
-        if message.channel.id == channel_id:
-            detected_faction = detect_faction_from_message(message.content, faction)
-            if not detected_faction:
-                print("Could not detect faction from message content")
-                return
-            channel_faction = detected_faction
-            break
+    faction = buff_data.get("faction")
+    if faction not in {"horde", "alliance"}:
+        logger.error("Invalid faction: %s", faction)
+        return False
 
-    if not channel_faction:
-        return
+    path = f"{faction}_buffs.json"
+    headers = {
+        "Authorization": f"token {GITHUB_TOKEN}",
+        "Accept": "application/vnd.github.v3+json",
+    }
 
-    print(f'\nProcessing message from {message.author.name}:')
-    print(f'Content: {message.content}')
-   
-    buff_data_list = parse_buff_with_ai(message.content)
-   
-    if buff_data_list:
-        print(f'\nFound {len(buff_data_list)} buffs:')
-        for buff_data in buff_data_list:
-            print(f"- {buff_data['buff']} by {buff_data['guild']} at {buff_data['datetime']}")
-            buff_data['faction'] = channel_faction
-            await publish_buff_to_github(buff_data)
-   
-    await bot.process_commands(message)
+    # Use a short-lived Session per call to benefit from connection pooling
+    with requests.Session() as session:
+        session.headers.update(headers)
 
-@bot.event
-async def on_message_edit(before, after):
-    """Handle edited messages the same way as new messages"""
-    if after.author == bot.user:
-        return
-
-    # Check if message is from any of our buff channels
-    channel_faction = None
-    for faction, (channel_id, faction_name) in BUFF_CHANNEL.items():
-        if after.channel.id == channel_id:
-            detected_faction = detect_faction_from_message(after.content, faction)
-            if not detected_faction:
-                print("Could not detect faction from message content")
-                return
-            channel_faction = detected_faction
-            break
-
-    if not channel_faction:
-        return
-
-    print(f"\nEdited message from {after.author.name}:")
-    print(f"Before: {before.content}")
-    print(f"After: {after.content}")
-   
-    buff_data_list = parse_buff_with_ai(after.content)
-   
-    if buff_data_list:
-        print(f"\nFound {len(buff_data_list)} buffs:")
-        for buff_data in buff_data_list:
-            print(f"- {buff_data['buff']} by {buff_data['guild']} at {buff_data['datetime']}")
-            buff_data['faction'] = channel_faction
-            await publish_buff_to_github(buff_data, is_edit=True, original_message=before.content)
-    else:
-        print("No buffs found in edited message or error occurred")
-        if any(keyword in after.content.lower() for keyword in ['zg', 'ony', 'rend', 'nef']):
-            await after.channel.send("Could not parse buffs from edited message. Please use format: <Guild> MM.DD.YY <emoji> HH:MM AM/PM")
-
-@bot.command(name='test_parse')
-async def test_parse(ctx, *, message_content):
-    """Test the message parser with custom content"""
-    buff_data_list = parse_buff_with_ai(message_content)
-    if buff_data_list:
-        response = f"Found {len(buff_data_list)} buffs:\n"
-        for i, buff_data in enumerate(buff_data_list, 1):
-            response += f"{i}. **{buff_data['buff']}** by *{buff_data['guild']}* at `{buff_data['datetime']}`\n"
-    else:
-        response = "No buffs found in the message."
-   
-    await ctx.send(response)
-
-async def publish_buff_to_github(buff_data, is_edit=False, original_message=None):
-    """Publish a buff to GitHub using the same logic as add-buff.js"""
-    try:
-        token = os.getenv('GITHUB_TOKEN')
-        if not token:
-            print("❌ Error: GitHub token not configured")
-            return False
-
-        faction = buff_data['faction']
-        # Ensure we use the correct filename format
-        if faction not in ['horde', 'alliance']:
-            print(f"❌ Invalid faction: {faction}")
-            return False
-            
-        path = f"{faction}_buffs.json"
-       
-        headers = {
-            'Authorization': f'token {token}',
-            'Accept': 'application/vnd.github.v3+json'
-        }
-       
-        # Get current file content
-        url = f'https://api.github.com/repos/cougtrades/wowbuffs/contents/{path}'
-        file_response = requests.get(url, headers=headers)
-       
+        # Fetch current file
+        url = f"https://api.github.com/repos/cougtrades/wowbuffs/contents/{path}"
+        file_response = session.get(url, timeout=20)
         if not file_response.ok:
-            print(f"❌ Failed to fetch file: {file_response.text}")
+            logger.error("Failed to fetch file %s: %s", path, file_response.text)
             return False
-           
-        file_data = file_response.json()
-        current_content = json.loads(base64.b64decode(file_data['content']).decode('utf8'))
-       
-        # Create new buff entry
-        new_buff = {
-            'datetime': buff_data['datetime'],
-            'guild': buff_data['guild'],
-            'buff': buff_data['buff'],
-            'notes': buff_data.get('notes', ''),
-            'server': 'Doomhowl'
-        }
 
-        # Check for duplicates
+        file_data = file_response.json()
+        current_content: List[Dict[str, Any]] = json.loads(base64.b64decode(file_data["content"]).decode("utf-8"))
+
+        new_buff = BuffEntry.from_dict(
+            {
+                "datetime": buff_data["datetime"],
+                "guild": buff_data["guild"],
+                "buff": buff_data["buff"],
+                "notes": buff_data.get("notes", ""),
+                "server": "Doomhowl",
+            }
+        )
+
+        # Duplicate check
         if is_duplicate_buff(new_buff, current_content):
-            print(f"⚠️ Skipping duplicate buff: {new_buff['guild']} {new_buff['buff']} at {new_buff['datetime']}")
+            logger.info(
+                "Skipping duplicate buff: %s %s at %s",
+                new_buff.guild,
+                new_buff.buff,
+                new_buff.datetime,
+            )
             return True
 
         # If this is an edit, parse the original message and remove the old entry
         if is_edit and original_message:
-            original_buff_data_list = parse_buff_with_ai(original_message)
-            if original_buff_data_list:
-                original_buff = original_buff_data_list[0]
-                # Remove the old entry that matches the original message
-                current_content = [
-                    buff for buff in current_content 
-                    if not (buff['datetime'] == original_buff['datetime'] and 
-                           buff['guild'].lower() == original_buff['guild'].lower() and 
-                           buff['buff'] == original_buff['buff'])
-                ]
+            try:
+                original_list = parse_buff_with_ai_blocking(original_message)
+                if original_list:
+                    original_buff = BuffEntry.from_dict(original_list[0])
+                    current_content = [
+                        b
+                        for b in current_content
+                        if not (
+                            b.get("datetime") == original_buff.datetime
+                            and str(b.get("guild", "")).lower() == original_buff.guild.lower()
+                            and b.get("buff") == original_buff.buff
+                        )
+                    ]
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Failed to parse original message during edit cleanup: %s", exc)
 
         # Add new buff and sort
-        current_content.append(new_buff)
-        current_content.sort(key=lambda x: x['datetime'])
-       
+        current_content.append(new_buff.__dict__)
+        current_content.sort(key=lambda x: x["datetime"])  # ISO datetime sorts lexicographically
+
         # Update file on GitHub
-        update_response = requests.put(
-            f'https://api.github.com/repos/cougtrades/wowbuffs/contents/{path}',
-            headers=headers,
+        update_response = session.put(
+            url,
             json={
-                'message': f'Update {path} with new buff from Discord: {new_buff["guild"]} {new_buff["buff"]}',
-                'content': base64.b64encode(json.dumps(current_content, indent=4).encode()).decode(),
-                'sha': file_data['sha']
-            }
+                "message": f'Update {path} with new buff from Discord: {new_buff.guild} {new_buff.buff}',
+                "content": base64.b64encode(json.dumps(current_content, indent=4).encode("utf-8")).decode("utf-8"),
+                "sha": file_data["sha"],
+            },
+            timeout=20,
         )
-       
+
         if not update_response.ok:
-            print(f"❌ Failed to update file: {update_response.text}")
+            logger.error("Failed to update file %s: %s", path, update_response.text)
             return False
-           
-        print(f"✅ Published buff: {new_buff['guild']} {new_buff['buff']}")
+
+        logger.info("Published buff: %s %s", new_buff.guild, new_buff.buff)
         return True
-       
-    except Exception as e:
-        print(f"❌ Error publishing to GitHub: {str(e)}")
+
+
+async def publish_buff_to_github(buff_data: Dict[str, Any], *, is_edit: bool = False, original_message: Optional[str] = None) -> bool:
+    try:
+        return await asyncio.to_thread(
+            publish_buff_to_github_blocking,
+            buff_data,
+            is_edit=is_edit,
+            original_message=original_message,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.error("Error publishing to GitHub: %s", exc)
         return False
 
-def detect_faction_from_message(message_content, channel_type=None):
-    """Detect faction from message content based on channel type and emojis"""
-    # If it's the "both" channel, we need to detect from emojis
-    if channel_type == 'both':
-        if ':horde:' in message_content.lower():
-            return 'horde'
-        elif ':alliance:' in message_content.lower():
-            return 'alliance'
-        return None
-    
-    # For horde and alliance channels, use the channel type
-    return channel_type
+# --------------------------------------------------------------------------------------
+# Centralized message handling
+# --------------------------------------------------------------------------------------
 
-def is_duplicate_buff(buff_data, current_content):
-    """Check if a buff is a duplicate based on datetime, guild, and buff type"""
-    for existing_buff in current_content:
-        if (existing_buff['datetime'] == buff_data['datetime'] and
-            existing_buff['guild'].lower() == buff_data['guild'].lower() and
-            existing_buff['buff'] == buff_data['buff']):
-            return True
-    return False
+async def process_and_publish(
+    message_content: str,
+    detected_faction: Optional[str],
+    *,
+    is_edit: bool = False,
+    original_message: Optional[str] = None,
+    author_for_logs: str = "",
+) -> None:
+    if not detected_faction:
+        logger.info("Could not detect faction from message content")
+        return
 
-def main():
-    token = os.getenv('DISCORD_TOKEN')
-    if not token:
-        print('Error: DISCORD_TOKEN not found in .env file')
+    logger.info("Processing message from %s", author_for_logs or "unknown")
+    logger.debug("Content: %s", message_content)
+
+    buff_data_list = await parse_buff_with_ai(message_content)
+    if not buff_data_list:
+        logger.info("No buffs found in the message or parsing failed")
         return
-   
-    if not os.getenv('OPENAIKEY'):
-        print('Error: OPENAIKEY not found in .env file')
+
+    logger.info("Found %d buff(s)", len(buff_data_list))
+    for buff_data in buff_data_list:
+        # Validate and enrich
+        try:
+            entry = BuffEntry.from_dict(buff_data)
+        except KeyError as exc:  # missing keys
+            logger.warning("Skipping malformed buff entry missing %s: %s", exc, buff_data)
+            continue
+
+        logger.info("- %s by %s at %s", entry.buff, entry.guild, entry.datetime)
+        buff_payload: Dict[str, Any] = {
+            "datetime": entry.datetime,
+            "guild": entry.guild,
+            "buff": entry.buff,
+            "notes": entry.notes,
+            "server": entry.server,
+            "faction": detected_faction,
+        }
+        await publish_buff_to_github(buff_payload, is_edit=is_edit, original_message=original_message)
+
+# --------------------------------------------------------------------------------------
+# Discord events and commands
+# --------------------------------------------------------------------------------------
+
+@bot.event
+async def on_ready() -> None:
+    logger.info("Bot is ready! Logged in as %s", bot.user.name if bot.user else "<unknown>")
+
+    # Monitor all configured channels by fetching the last message per channel
+    for faction_key, (channel_id, channel_type) in BUFF_CHANNEL.items():
+        channel = bot.get_channel(channel_id)
+        if not channel:
+            logger.error("Channel not found (ID: %s)", channel_id)
+            continue
+
+        logger.info("Monitoring %s channel: %s", faction_key, getattr(channel, "name", str(channel_id)))
+
+        try:
+            async for message in channel.history(limit=1):
+                if message.author == bot.user:
+                    continue
+                detected_faction = detect_faction_from_message(message.content, channel_type)
+                await process_and_publish(
+                    message.content,
+                    detected_faction,
+                    author_for_logs=getattr(message.author, "name", ""),
+                )
+        except Exception as exc:  # noqa: BLE001
+            logger.error("Failed to read history for channel %s: %s", channel_id, exc)
+
+
+@bot.event
+async def on_message(message: discord.Message) -> None:
+    if message.author == bot.user:
         return
-   
-    if not os.getenv('GITHUB_TOKEN'):
-        print('Error: GITHUB_TOKEN not found in .env file')
+
+    # Check if message is from any of our buff channels
+    channel_faction: Optional[str] = None
+    for faction_key, (channel_id, channel_type) in BUFF_CHANNEL.items():
+        if message.channel.id == channel_id:
+            channel_faction = detect_faction_from_message(message.content, channel_type)
+            break
+
+    if not channel_faction:
+        await bot.process_commands(message)
         return
-   
+
+    await process_and_publish(
+        message.content,
+        channel_faction,
+        author_for_logs=getattr(message.author, "name", ""),
+    )
+
+    await bot.process_commands(message)
+
+
+@bot.event
+async def on_message_edit(before: discord.Message, after: discord.Message) -> None:
+    if after.author == bot.user:
+        return
+
+    # Check if message is from any of our buff channels
+    channel_faction: Optional[str] = None
+    for faction_key, (channel_id, channel_type) in BUFF_CHANNEL.items():
+        if after.channel.id == channel_id:
+            channel_faction = detect_faction_from_message(after.content, channel_type)
+            break
+
+    if not channel_faction:
+        return
+
+    await process_and_publish(
+        after.content,
+        channel_faction,
+        is_edit=True,
+        original_message=before.content,
+        author_for_logs=getattr(after.author, "name", ""),
+    )
+
+
+@bot.command(name="test_parse")
+async def test_parse(ctx: commands.Context, *, message_content: str) -> None:
+    """Test the message parser with custom content."""
+    buff_data_list = await parse_buff_with_ai(message_content)
+    if not buff_data_list:
+        await ctx.send("No buffs found in the message.")
+        return
+
+    lines = [f"Found {len(buff_data_list)} buffs:"]
+    for i, buff_data in enumerate(buff_data_list, start=1):
+        try:
+            entry = BuffEntry.from_dict(buff_data)
+        except KeyError:
+            continue
+        lines.append(f"{i}. **{entry.buff}** by *{entry.guild}* at `{entry.datetime}`")
+    await ctx.send("\n".join(lines))
+
+# --------------------------------------------------------------------------------------
+# Entrypoint
+# --------------------------------------------------------------------------------------
+
+def main() -> None:
+    if not DISCORD_TOKEN:
+        logger.error("DISCORD_TOKEN not found in environment")
+        print("Error: DISCORD_TOKEN not found in .env file")
+        return
+    if not OPENAI_API_KEY:
+        logger.error("OPENAIKEY not found in environment")
+        print("Error: OPENAIKEY not found in .env file")
+        return
+    if not GITHUB_TOKEN:
+        logger.error("GITHUB_TOKEN not found in environment")
+        print("Error: GITHUB_TOKEN not found in .env file")
+        return
+
     try:
-        bot.run(token)
-    except Exception as e:
-        logger.error(f"Error running bot: {e}")
-        print(f"Error running bot: {e}")
+        bot.run(DISCORD_TOKEN)
+    except Exception as exc:  # noqa: BLE001
+        logger.error("Error running bot: %s", exc)
+        print(f"Error running bot: {exc}")
 
-if __name__ == '__main__':
+
+if __name__ == "__main__":
     main()
