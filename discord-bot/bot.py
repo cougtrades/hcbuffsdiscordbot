@@ -113,6 +113,27 @@ def detect_faction_from_message(message_content: str, channel_type: Optional[str
         return None
     return channel_type
 
+
+def contains_cancel_intent(message_content: str) -> bool:
+    """Heuristically detect if a message intends to cancel/delete a prior buff announcement."""
+    lower = message_content.lower()
+    # Simple, conservative keyword set with word boundaries
+    cancel_patterns = [
+        r"\bcancel\b",
+        r"\bcanceled\b",
+        r"\bcancelled\b",
+        r"\bdelete\b",
+        r"\bremoved?\b",
+        r"\bvoid\b",
+        r"\bnevermind\b",
+        r"\bnm\b",
+        r"\bignore\b",
+        r"\bwrong\b",
+        r"\bcall it off\b",
+    ]
+    return any(re.search(pat, lower) for pat in cancel_patterns)
+
+
 # --------------------------------------------------------------------------------------
 # OpenAI parsing (blocking + async wrapper)
 # --------------------------------------------------------------------------------------
@@ -233,7 +254,13 @@ async def parse_buff_with_ai(message_content: str) -> Optional[List[Dict[str, An
 # GitHub publishing (blocking + async wrapper)
 # --------------------------------------------------------------------------------------
 
-def publish_buff_to_github_blocking(buff_data: Dict[str, Any], *, is_edit: bool = False, original_message: Optional[str] = None) -> bool:
+def publish_buff_to_github_blocking(
+    buff_data: Dict[str, Any],
+    *,
+    is_edit: bool = False,
+    original_message: Optional[str] = None,
+    delete_only: bool = False,
+) -> bool:
     if not GITHUB_TOKEN:
         logger.error("GitHub token not configured")
         return False
@@ -262,6 +289,49 @@ def publish_buff_to_github_blocking(buff_data: Dict[str, Any], *, is_edit: bool 
 
         file_data = file_response.json()
         current_content: List[Dict[str, Any]] = json.loads(base64.b64decode(file_data["content"]).decode("utf-8"))
+
+        # Delete-only path: remove based on the original message and update file
+        if delete_only:
+            if not original_message:
+                logger.error("delete_only requested but original_message was not provided")
+                return False
+            try:
+                original_list = parse_buff_with_ai_blocking(original_message)
+                if original_list:
+                    original_buff = BuffEntry.from_dict(original_list[0])
+                    before_len = len(current_content)
+                    current_content = [
+                        b
+                        for b in current_content
+                        if not (
+                            b.get("datetime") == original_buff.datetime
+                            and str(b.get("guild", "")).lower() == original_buff.guild.lower()
+                            and b.get("buff") == original_buff.buff
+                        )
+                    ]
+                    if len(current_content) == before_len:
+                        logger.info("No matching buff to remove for delete request")
+                else:
+                    logger.info("No structured buff found in original message for deletion")
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Failed to parse original message during delete: %s", exc)
+
+            update_response = session.put(
+                url,
+                json={
+                    "message": f'Remove entry from {path} due to cancellation/deletion',
+                    "content": base64.b64encode(json.dumps(current_content, indent=4).encode("utf-8")).decode("utf-8"),
+                    "sha": file_data["sha"],
+                },
+                timeout=20,
+            )
+
+            if not update_response.ok:
+                logger.error("Failed to update file %s: %s", path, update_response.text)
+                return False
+
+            logger.info("Removed buff entry on request")
+            return True
 
         new_buff = BuffEntry.from_dict(
             {
@@ -324,13 +394,20 @@ def publish_buff_to_github_blocking(buff_data: Dict[str, Any], *, is_edit: bool 
         return True
 
 
-async def publish_buff_to_github(buff_data: Dict[str, Any], *, is_edit: bool = False, original_message: Optional[str] = None) -> bool:
+async def publish_buff_to_github(
+    buff_data: Dict[str, Any],
+    *,
+    is_edit: bool = False,
+    original_message: Optional[str] = None,
+    delete_only: bool = False,
+) -> bool:
     try:
         return await asyncio.to_thread(
             publish_buff_to_github_blocking,
             buff_data,
             is_edit=is_edit,
             original_message=original_message,
+            delete_only=delete_only,
         )
     except Exception as exc:  # noqa: BLE001
         logger.error("Error publishing to GitHub: %s", exc)
@@ -347,6 +424,7 @@ async def process_and_publish(
     is_edit: bool = False,
     original_message: Optional[str] = None,
     author_for_logs: str = "",
+    original_message_for_parse: Optional[str] = None,
 ) -> None:
     if not detected_faction:
         logger.info("Could not detect faction from message content")
@@ -355,7 +433,16 @@ async def process_and_publish(
     logger.info("Processing message from %s", author_for_logs or "unknown")
     logger.debug("Content: %s", message_content)
 
-    buff_data_list = await parse_buff_with_ai(message_content)
+    # If we have original context (reply/edit), combine it to aid parsing updates with partial info
+    parse_input = message_content
+    if original_message_for_parse:
+        parse_input = (
+            f"Original announcement:\n{original_message_for_parse}\n\n"
+            f"Update message:\n{message_content}\n\n"
+            f"Extract and return only the final, updated buff announcement."
+        )
+
+    buff_data_list = await parse_buff_with_ai(parse_input)
     if not buff_data_list:
         logger.info("No buffs found in the message or parsing failed")
         return
@@ -378,7 +465,11 @@ async def process_and_publish(
             "server": entry.server,
             "faction": detected_faction,
         }
-        await publish_buff_to_github(buff_payload, is_edit=is_edit, original_message=original_message)
+        await publish_buff_to_github(
+            buff_payload,
+            is_edit=is_edit,
+            original_message=original_message,
+        )
 
 # --------------------------------------------------------------------------------------
 # Discord events and commands
@@ -418,11 +509,66 @@ async def on_message(message: discord.Message) -> None:
 
     # Check if message is from any of our buff channels
     channel_faction: Optional[str] = None
-    for faction_key, (channel_id, channel_type) in BUFF_CHANNEL.items():
+    channel_type: Optional[str] = None
+    for faction_key, (channel_id, ct) in BUFF_CHANNEL.items():
         if message.channel.id == channel_id:
-            channel_faction = detect_faction_from_message(message.content, channel_type)
+            channel_type = ct
+            channel_faction = detect_faction_from_message(message.content, ct)
             break
 
+    if not channel_type:
+        await bot.process_commands(message)
+        return
+
+    # If the message is a reply to an earlier announcement, treat it as an update/cancel
+    if message.reference and message.reference.message_id:
+        referenced_message: Optional[discord.Message] = None
+        try:
+            # Prefer resolved reference when available
+            if message.reference.resolved and isinstance(message.reference.resolved, discord.Message):
+                referenced_message = message.reference.resolved
+            else:
+                referenced_message = await message.channel.fetch_message(message.reference.message_id)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Could not fetch referenced message: %s", exc)
+            referenced_message = None
+
+        if referenced_message:
+            # Determine faction based on the referenced content if channel is 'both'
+            ref_faction = channel_faction if channel_type != "both" else detect_faction_from_message(referenced_message.content, "both")
+
+            # Handle cancellation intent
+            if contains_cancel_intent(message.content):
+                factions_to_process: List[str] = []
+                if ref_faction in {"horde", "alliance"}:
+                    factions_to_process = [ref_faction]
+                else:
+                    factions_to_process = ["horde", "alliance"]
+
+                for fac in factions_to_process:
+                    await publish_buff_to_github(
+                        {"faction": fac},
+                        is_edit=False,
+                        original_message=referenced_message.content,
+                        delete_only=True,
+                    )
+                await bot.process_commands(message)
+                return
+
+            # Treat as an edit/update (use original content for both parsing context and cleanup)
+            detected_faction_effective = ref_faction if ref_faction else channel_faction
+            await process_and_publish(
+                message.content,
+                detected_faction_effective,
+                is_edit=True,
+                original_message=referenced_message.content,
+                author_for_logs=getattr(message.author, "name", ""),
+                original_message_for_parse=referenced_message.content,
+            )
+            await bot.process_commands(message)
+            return
+
+    # Non-reply fallback: treat as a fresh announcement if faction is detectable
     if not channel_faction:
         await bot.process_commands(message)
         return
@@ -443,21 +589,61 @@ async def on_message_edit(before: discord.Message, after: discord.Message) -> No
 
     # Check if message is from any of our buff channels
     channel_faction: Optional[str] = None
-    for faction_key, (channel_id, channel_type) in BUFF_CHANNEL.items():
+    channel_type: Optional[str] = None
+    for faction_key, (channel_id, ct) in BUFF_CHANNEL.items():
         if after.channel.id == channel_id:
-            channel_faction = detect_faction_from_message(after.content, channel_type)
+            channel_type = ct
+            channel_faction = detect_faction_from_message(after.content, ct)
             break
 
-    if not channel_faction:
+    if not channel_type:
         return
+
+    # If channel is 'both', try to infer faction from the previous content when missing
+    effective_faction = channel_faction
+    if channel_type == "both" and not effective_faction:
+        effective_faction = detect_faction_from_message(before.content, "both")
 
     await process_and_publish(
         after.content,
-        channel_faction,
+        effective_faction,
         is_edit=True,
         original_message=before.content,
         author_for_logs=getattr(after.author, "name", ""),
+        original_message_for_parse=before.content,
     )
+
+
+@bot.event
+async def on_message_delete(message: discord.Message) -> None:
+    # Remove the corresponding buff entry when a message is deleted in our channels
+    if message.author == bot.user:
+        return
+
+    channel_type: Optional[str] = None
+    for faction_key, (channel_id, ct) in BUFF_CHANNEL.items():
+        if message.channel.id == channel_id:
+            channel_type = ct
+            break
+
+    if not channel_type:
+        return
+
+    # Determine faction(s) to remove from
+    factions_to_process: List[str] = []
+    detected = detect_faction_from_message(message.content, channel_type)
+    if detected in {"horde", "alliance"}:
+        factions_to_process = [detected]
+    elif channel_type == "both":
+        factions_to_process = ["horde", "alliance"]
+
+    for fac in factions_to_process:
+        await publish_buff_to_github(
+            {"faction": fac},
+            is_edit=False,
+            original_message=message.content,
+            delete_only=True,
+        )
 
 
 @bot.command(name="test_parse")
